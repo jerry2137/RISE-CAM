@@ -1,6 +1,9 @@
 # RISE-CAM: Explainable AI for Image Classification
-This repository contains source code necessary to reproduce the main results in this project:
-
+This repository contains source code necessary to reproduce the main results in a Final Year Project finished at the City University of Hong Kong.
+- Student name: WU, Chou-Ling
+- Student number: 56512971
+- Project code: 23CS029
+- Project title: Explainable AI (XAI) for Image Classification, Final Report
 
 ## Method overview
 This repository introduces two novel algorithms--RISE-CAM and RISExCAM. These algorithms are merge from two classic XAI algorithms, RISE and Grad-CAM. Below is the flow chart of how RISE-CAM works.
