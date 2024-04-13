@@ -327,6 +327,36 @@ def risecam(model, input_tensor, top_k='auto', input_size=(224, 224), N=6000, s=
         indices = np.argsort(gradcam_sal_flatten)[::-1]
         saliency_maps_sorted = feature_saliency_flatten[indices]
 
+        # Find the k value that has the highest score.
+        saliency_map_sum = np.zeros(saliency_maps_sorted[0].shape)
+        best_score = -np.Inf
+        best_k = 0
+        for i, saliency_map in enumerate(saliency_maps_sorted):
+            saliency_map_sum += saliency_map
+            insertion = CausalMetric(model, 'ins', height, substrate_fn=blur)
+            deletion = CausalMetric(model, 'del', height, substrate_fn=torch.zeros_like)
+            insertion_result = insertion.single_run(input_tensor, saliency_map_sum, height*width)
+            deletion_result = deletion.single_run(input_tensor, saliency_map_sum, height*width)
+            score = auc(insertion_result, fraction=0.2) - auc(deletion_result, fraction=0.2)
+            if(score > best_score):
+                best_score = score
+                best_k = i + 1
+                saliency_map_best = saliency_map_sum.copy()
+        print('best value for k is: {}'.format(best_k))
+
+        return saliency_map_best
+    
+        
+    # Auto select top k value within top 20% and return the sum of the top k feature saliency maps.
+    if(top_k == 'optimal'):
+        indices = np.argsort(gradcam_sal_flatten)[::-1]
+        saliency_maps_sorted = feature_saliency_flatten[indices]
+
+        # Selct the top 20% only.
+        fraction = 0.2
+        saliency_maps_sorted = saliency_maps_sorted[:int(len(saliency_maps_sorted) * (fraction))]
+
+        # Find the k value that has the highest score.
         saliency_map_sum = np.zeros(saliency_maps_sorted[0].shape)
         best_score = -np.Inf
         best_k = 0
