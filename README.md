@@ -3,7 +3,7 @@ This repository contains source code necessary to reproduce the main results in 
 - Student name: WU, Chou-Ling
 - Student number: 56512971
 - Project code: 23CS029
-- Project title: Explainable AI (XAI) for Image Classification, Final Report
+- Project title: Explainable AI (XAI) for Image Classification
 
 ## Method overview
 This repository introduces two novel algorithms--RISE-CAM and RISExCAM. These algorithms are merge from two classic XAI algorithms, RISE and Grad-CAM. Below is the flow chart of how RISE-CAM works.

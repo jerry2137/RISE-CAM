@@ -1,4 +1,5 @@
 import os
+import copy
 import numpy as np
 from matplotlib import pyplot as plt
 from tqdm import tqdm
@@ -11,6 +12,7 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import torch.utils.data
 
+from torchvision import models
 from torchvision import transforms
 from torchvision.transforms.functional import to_pil_image
 
@@ -22,11 +24,24 @@ cudnn.benchmark = True
 read_tensor = transforms.Compose([
     lambda x: Image.open(x),
     transforms.Resize((224, 224)),
+    lambda x: x.convert("RGB"),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                           std=[0.229, 0.224, 0.225]),
     lambda x: torch.unsqueeze(x, 0)
 ])
+
+# Load black box model for explanations
+def get_model():
+    model = models.resnet50(True)
+    model = nn.Sequential(model, nn.Softmax(dim=1))
+    model = model.eval()
+    model = model.cuda()
+
+    for p in model.parameters():
+        p.requires_grad = False
+
+    return model
 
 # Plots image from tensor
 def tensor_imshow(inp, title=None, **kwargs):
@@ -46,9 +61,8 @@ def get_class_name(c):
     labels = np.loadtxt('synset_words.txt', str, delimiter='\t')
     return ' '.join(labels[c].split(',')[0].split()[1:])
 
-# Returns normalized Area Under Curve of the first 20 Percent of the array
+# Returns normalized Area Under Curve of the top fraction of the array
 def auc(arr, fraction=1.0):
-    """Returns normalized Area Under Curve of the top fraction of the array."""
     arr = arr[:int(len(arr) * (fraction))]
     return (arr.sum() - arr[0] / 2 - arr[-1] / 2) / (arr.shape[0] - 1)
 
@@ -155,9 +169,8 @@ class CausalMetric():
         return scores
 
 class RISE(nn.Module):
-    def __init__(self, model, input_size, gpu_batch=100):
+    def __init__(self, input_size, gpu_batch=100):
         super(RISE, self).__init__()
-        self.model = model
         self.input_size = input_size
         self.gpu_batch = gpu_batch
 
@@ -199,8 +212,9 @@ class RISE(nn.Module):
 
         # Feed the masked images into the model.
         p = []
+        model = get_model()
         for i in range(0, N, self.gpu_batch):
-            p.append(self.model(stack[i:min(i + self.gpu_batch, N)]))
+            p.append(model(stack[i:min(i + self.gpu_batch, N)]))
         p = torch.cat(p)
         CL = p.size(1) # Number of classes
 
@@ -213,6 +227,7 @@ class RISE(nn.Module):
 class RISECAM(RISE):
     def forward(self, x):
         N = self.N
+        self.model = get_model()
         _, _, H, W = x.size()
         # Apply array of filters to the image
         masked_imgs = torch.mul(self.masks, x.data)
@@ -238,14 +253,10 @@ class RISECAM(RISE):
         return sals
 
 
-
-def rise(model, input_tensor, input_size=(224, 224), N=6000, s=8, p1=0.1, mask_path=''):
-    # Freeze the gradient.
-    for p in model.parameters():
-        p.requires_grad = False
+def rise(input_tensor, input_size=(224, 224), N=6000, s=8, p1=0.1, mask_path=''):
 
     # Create explainer
-    rise_explainer = RISE(model, input_size)
+    rise_explainer = RISE(input_size)
 
     # Generate/load masks for RISE.
     if(os.path.isfile(mask_path) & mask_path.endswith('.npy')):
@@ -256,6 +267,7 @@ def rise(model, input_tensor, input_size=(224, 224), N=6000, s=8, p1=0.1, mask_p
         rise_explainer.generate_masks(N=N, s=s, p1=p1, savepath='masks_{}.npy'.format(N))
     
     # Get the predicted class.
+    model = get_model()
     _, class_number = torch.topk(model(input_tensor.cuda()), k=1)
     class_number = class_number[0]
 
@@ -265,11 +277,8 @@ def rise(model, input_tensor, input_size=(224, 224), N=6000, s=8, p1=0.1, mask_p
     return saliency_map
 
 
-def gradcam(model, input_tensor, input_size=(224, 224)):
-    # Freeze the gradient.
-    for p in model.parameters():
-        p.requires_grad = False
-
+def gradcam(input_tensor, input_size=(224, 224), new_risecam=False):
+    model = get_model()
     # Generate saliency map.
     input_tensor.requires_grad = True
     with SmoothGradCAMpp(model) as cam_extractor:
@@ -277,20 +286,22 @@ def gradcam(model, input_tensor, input_size=(224, 224)):
         _, class_number = torch.topk(out, k=1)
         class_number = class_number[0]
         sal = cam_extractor(class_number[0].item(), out)
+        layer_name = cam_extractor.target_names[0]
     input_tensor.requires_grad = False
 
-    overlay = to_pil_image(sal[0][0], mode='F').resize(input_size, resample=Image.BICUBIC)
-    saliency_map = np.asarray(overlay)
-    return saliency_map
+    if new_risecam:
+        gradcam_sal_flatten = sal[0].flatten()
+        return layer_name, gradcam_sal_flatten.cpu()
+
+    overlay = to_pil_image(sal[0][0], mode='F')
+    overlay = overlay.resize(input_size, resample=Image.BICUBIC)
+    return  np.asarray(overlay)
 
 
-def risecam(model, input_tensor, top_k='auto', input_size=(224, 224), N=6000, s=8, p1=0.1, mask_path=''):
-    # Freeze the gradient.
-    for p in model.parameters():
-        p.requires_grad = False
+def risecam(input_tensor, top_k='optimal', input_size=(224, 224), N=6000, s=8, p1=0.1, mask_path=''):
     
     # Create explainer.
-    risecam_explainer = RISECAM(model, input_size)
+    risecam_explainer = RISECAM(input_size)
     
     # Generate/load masks for RiseCAM.
     if(os.path.isfile(mask_path) & mask_path.endswith('.npy')):
@@ -304,6 +315,7 @@ def risecam(model, input_tensor, top_k='auto', input_size=(224, 224), N=6000, s=
     feature_saliency_maps = risecam_explainer(input_tensor.cuda()).cpu().numpy()
 
     # Generate GradCAM saliency map.
+    model = get_model()
     with SmoothGradCAMpp(model) as cam_extractor:
         out = model(input_tensor.cuda())
         _, class_number = torch.topk(out, k=1)
@@ -332,6 +344,7 @@ def risecam(model, input_tensor, top_k='auto', input_size=(224, 224), N=6000, s=
         best_score = -np.Inf
         best_k = 0
         for i, saliency_map in enumerate(saliency_maps_sorted):
+            model = get_model()
             saliency_map_sum += saliency_map
             insertion = CausalMetric(model, 'ins', height, substrate_fn=blur)
             deletion = CausalMetric(model, 'del', height, substrate_fn=torch.zeros_like)
@@ -379,3 +392,117 @@ def risecam(model, input_tensor, top_k='auto', input_size=(224, 224), N=6000, s=
     indices = np.argpartition(gradcam_sal_flatten,-top_k)[-top_k:]
     saliency_map = np.mean(feature_saliency_flatten[indices], axis=0)
     return saliency_map
+
+
+def get_hidden_features(x, layer, model):
+    activation = {}
+
+    def get_activation(name):
+        def hook(m, i, o):
+            activation[name] = o.detach()
+        return hook
+
+    model.get_submodule(layer).register_forward_hook(get_activation(layer))
+    _ = model(x)
+    return activation[layer]
+
+def generate_masks_weighted(mask_number, mask_size, img_size, distribution):
+    masks = torch.ones(mask_number, 1, img_size[0], img_size[1])
+    mask_half_height, mask_half_width = mask_size[0]//2, mask_size[1]//2
+
+    distribution = np.pad(distribution, [[mask_half_height]*2, [mask_half_width]*2], constant_values=distribution.min())
+    distribution_flatten = distribution.flatten()
+    distribution_normalized = distribution_flatten / distribution_flatten.sum()
+
+    points_number = np.random.choice(
+        a=np.arange(0, (img_size[0]+mask_size[0])*(img_size[1]+mask_size[1])),
+        size=mask_number,
+        p=distribution_normalized,
+    )
+    masks_center_x = points_number // (img_size[0]+mask_size[0]) - mask_half_height
+    masks_center_y = points_number % (img_size[1]+mask_size[1]) - mask_half_width
+    top = np.maximum(np.full_like(masks_center_x, 0), masks_center_x-mask_half_height)
+    buttom = np.minimum(np.full_like(masks_center_x, img_size[0]), masks_center_x+mask_half_height)
+    left = np.maximum(np.full_like(masks_center_y, 0), masks_center_y-mask_half_width)
+    right = np.minimum(np.full_like(masks_center_y, img_size[1]), masks_center_y+mask_half_width)
+    for i in range(mask_number):
+        masks[i, :, top[i]:buttom[i], left[i]:right[i]] = 0
+
+    return masks
+
+def get_gradrise_map(mask_number, mask_size, input_size, distribution, layer_name, input_tensor, gradcam_sal_flatten, verbose=False):
+    model = get_model()
+    # Generate masks.
+    masks = generate_masks_weighted(mask_number, mask_size, input_size, distribution)
+    # save the sum of the masks
+    mask_sum = torch.sum(masks, dim=0)[0]
+    # Apply the masks on the image.
+    masked_imgs = torch.mul(masks, input_tensor)
+    # Put the data on the GPU.
+    masked_imgs = masked_imgs.cuda()
+    if verbose:
+        masked_imgs = tqdm(masked_imgs)
+    # Get the feature maps of the original image.
+    feature = get_hidden_features(input_tensor.cuda(), layer_name, model)
+    # Get features in the black box.
+    masked_feature_list = []
+    for masked_img in masked_imgs:
+        masked_feature = get_hidden_features(masked_img[None, :, :, :], layer_name, model)
+        masked_feature_list.append(masked_feature)
+    masked_features = torch.cat(masked_feature_list)
+    # Put the data back on the CPU.
+    masked_features = masked_features.cpu()
+    feature = feature.cpu()
+    # Distance between the masked features and the original features.
+    weights = torch.sqrt(torch.sum(torch.pow(torch.subtract(masked_features, feature), 2), dim=1))
+    # Multiply the masks and the weights to get saliency maps for each feature.
+    weights_reshaped = torch.flatten(weights, start_dim=1, end_dim=2).T
+    masks_reshaped = 1 - torch.flatten(masks, start_dim=1, end_dim=3)
+    feature_saliency_maps = torch.matmul(weights_reshaped, masks_reshaped) # (49, 50176)
+    feature_saliency_maps = torch.unflatten(feature_saliency_maps, 1, (224, 224)) # (49, 224, 224)
+    # Sum the saliency maps with the gradcam value as weights.
+    saliency_map_weighted = torch.sum(torch.mul(feature_saliency_maps, gradcam_sal_flatten[:, None, None]), dim=0)
+    # saliency_map_weighted = torch.div(saliency_map_weighted, (mask_number - mask_sum + 1))
+    return saliency_map_weighted, mask_sum
+
+def gradrise(input_tensor, input_size=(224, 224), mask_size_init=(56, 56), mask_size_final=(12, 12), N=2000, mask_decay_factor=0.9, verbose=False):
+    saliency_maps = []
+    mask_sums = []
+    distributions = []
+    mask_size = mask_size_init
+    distribution = torch.ones(input_size[0], input_size[1])
+    layer_name, gradcam_sal_flatten = gradcam(input_tensor, input_size=(224, 224), new_risecam=True)
+    while mask_size >= mask_size_final:
+        if verbose:
+            print(mask_size)
+        saliency_map, mask_sum = get_gradrise_map(
+            N,
+            mask_size,
+            input_size,
+            distribution,
+            layer_name,
+            input_tensor=input_tensor,
+            gradcam_sal_flatten=gradcam_sal_flatten,
+            verbose=verbose,
+        )
+        # weight the saliency map with the number of the pixal being selected
+        saliency_map = torch.div(saliency_map, (N - mask_sum + 1))
+
+        distribution = copy.deepcopy(saliency_map)
+            
+        distributions.append(distribution)
+        mask_sums.append(mask_sum)
+
+        saliency_maps.append(saliency_map)
+
+        # sum contains Nan
+        if torch.isnan(distribution).any():
+            break
+        # sum = 0
+        if torch.sum(distribution).item() == 0:
+            break
+        # divide the mask size with the decay factor
+        mask_size = tuple(int(size*mask_decay_factor/2) * 2 for size in mask_size)
+    saliency_maps_tensor = torch.stack(saliency_maps)
+
+    return np.array(saliency_maps_tensor.sum(dim=0))
